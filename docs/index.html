@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Caption SEO Analyzer — CWI Agent Deck</title>
+<meta name="description" content="Zero-dependency deterministic analyzer: checks that your draft caption, on-screen text, and spoken transcript cover the track title and artist name (TikTok SEO input), flags missing keyword slots, and validates hashtag counts per platform.">
+<style>
+:root{--bg:#0d1117;--card:#161b22;--line:#30363d;--txt:#e6edf3;--dim:#8b949e;--acc:#58a6ff;--ok:#3fb950;--warn:#d29922;--bad:#f85149}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--txt);font:16px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+.wrap{max-width:900px;margin:0 auto;padding:24px 16px 64px}
+h1{font-size:1.6rem;margin:.2em 0}h2{font-size:1.15rem;margin:1.4em 0 .5em}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px;margin:12px 0}
+label{display:block;font-weight:600;margin:.8em 0 .3em}label small{display:block;font-weight:400;color:var(--dim)}
+input[type=text],textarea,select{width:100%;background:#0d1117;border:1px solid var(--line);color:var(--txt);border-radius:8px;padding:10px;font:inherit}
+textarea{min-height:88px;resize:vertical}
+button{background:var(--acc);color:#04121f;border:0;border-radius:8px;padding:12px 22px;font:inherit;font-weight:700;cursor:pointer;margin-top:14px}
+button:hover{filter:brightness(1.1)}
+.pill{display:inline-block;padding:3px 12px;border-radius:999px;font-weight:700;font-size:.85rem}
+.ok{background:#0f3d1e;color:#7ee787}.warn{background:#3a2c07;color:#e3b341}.bad{background:#4d1113;color:#ff7b72}.none{background:#2a2f36;color:var(--dim)}
+.kw{display:inline-block;border:1px solid var(--line);border-radius:6px;padding:2px 8px;margin:3px;font-size:.85rem}
+.kw .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-left:6px}
+li{margin:.35em 0}.dim{color:var(--dim);font-size:.9rem}
+table{width:100%;border-collapse:collapse;margin-top:8px}th,td{text-align:left;padding:8px;border-bottom:1px solid var(--line);font-size:.92rem}
+footer{margin-top:40px;color:var(--dim);font-size:.85rem;border-top:1px solid var(--line);padding-top:16px}
+a{color:var(--acc)}
+.score{font-size:2.6rem;font-weight:800;margin:0}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>🏷️ Caption SEO Analyzer <span class="dim">v1.0.0</span></h1>
+<p class="dim">Deterministic, runs 100% in your browser — no network calls, no data leaves this page. Paste a draft caption, your on-screen text, and the spoken-audio transcript; it checks keyword coverage of the track title / artist name across all three slots, flags missing keyword slots, and validates hashtag counts against 2026-research-based ranges per platform. Deep-link any analysis with <code>?share=</code> URLs.</p>
+
+<div class="card">
+  <label>Track title <small>e.g. Diabolique</small></label>
+  <input type="text" id="f-title" placeholder="Track title">
+  <label>Artist name <small>e.g. That Boy Hi Hat</small></label>
+  <input type="text" id="f-artist" placeholder="Artist name">
+  <label>Draft caption <small>the full caption text, hashtags included</small></label>
+  <textarea id="f-caption" placeholder="Your draft caption…"></textarea>
+  <label>On-screen text <small>exact text burned into the video frames</small></label>
+  <textarea id="f-onscreen" placeholder="On-screen text…"></textarea>
+  <label>Spoken transcript <small>what is actually said in the audio (TikTok indexes speech)</small></label>
+  <textarea id="f-transcript" placeholder="Spoken transcript…"></textarea>
+  <label>Platform <small>drives hashtag-count guidance only</small></label>
+  <select id="f-platform">
+    <option value="instagram">Instagram</option>
+    <option value="threads">Threads</option>
+    <option value="tiktok">TikTok</option>
+  </select>
+  <button id="btn-analyze">Analyze</button>
+  <button id="btn-share" type="button" style="background:#2a2f36;color:var(--txt);margin-left:8px">Copy share link</button>
+</div>
+
+<div id="results"></div>
+
+<div class="card">
+  <h2>Honest limits</h2>
+  <ul>
+    <li>This tool counts <em>words and hashtags</em>. It does not know TikTok's, Instagram's, or Threads' real ranking algorithms — nobody outside those companies does.</li>
+    <li>Hashtag ranges (IG 3–5, Threads 1, TikTok 1–2) are <strong>2026-research-based guidance</strong>, not platform-verified truth. See <a href="RESEARCH.md">RESEARCH.md</a> for sources.</li>
+    <li>Coverage uses whole-word, case-insensitive matching. Stemming, synonyms, and slang are not handled — "vibe" ≠ "vibes".</li>
+    <li>If you give it nothing to analyze, it says so — it will not invent a score.</li>
+  </ul>
+</div>
+
+<footer>
+  Caption SEO Analyzer v1.0.0 · © 2026 Cumulative Web Inc · Agent Deck · $0 · zero dependencies · <a href="RESEARCH.md">research basis</a>
+</footer>
+</div>
+<script src="seo.js"></script>
+<script>
+(function(){
+  "use strict";
+  var $ = function(id){ return document.getElementById(id); };
+  var SLOT_LABELS = { caption: "Caption", onscreen: "On-screen", transcript: "Transcript" };
+  function esc(s){ return String(s).replace(/[&<>"']/g, function(c){ return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]; }); }
+
+  function collect(){
+    return { title: $("f-title").value, artist: $("f-artist").value, caption: $("f-caption").value,
+             onscreen: $("f-onscreen").value, transcript: $("f-transcript").value, platform: $("f-platform").value };
+  }
+
+  function render(r){
+    var el = $("results");
+    if (r.status === "insufficient-input") {
+      el.innerHTML = '<div class="card"><span class="pill none">INSUFFICIENT INPUT</span><p>' + esc(r.message) + '</p>' +
+        '<p class="dim">Hashtags found in caption: ' + r.hashtags.count + ' (' + esc(r.hashtags.note) + ')</p></div>';
+      return;
+    }
+    var cls = r.coverageScore >= 90 ? "ok" : r.coverageScore >= 70 ? "ok" : r.coverageScore >= 40 ? "warn" : "bad";
+    var html = '<div class="card"><h2>Coverage score</h2><p class="score"><span class="pill ' + cls + '">' + r.coverageScore + ' / 100 — ' + esc(r.grade) + '</span></p>' +
+      '<p class="dim">Weighted coverage of title (×2) + artist (×1) keywords across caption, on-screen text, and spoken transcript. Bands are heuristic.</p>';
+
+    html += '<h2>Keyword coverage by slot</h2><table><tr><th>Keyword</th><th>Source</th><th>Caption</th><th>On-screen</th><th>Transcript</th></tr>';
+    r.keywords.forEach(function(k){
+      html += '<tr><td><strong>' + esc(k.token) + '</strong></td><td class="dim">' + esc(k.source) + '</td>' +
+        ["caption","onscreen","transcript"].map(function(s){
+          return '<td>' + (k.slots[s] ? '<span class="pill ok">✓</span>' : '<span class="pill bad">✗</span>') + '</td>';
+        }).join("") + '</tr>';
+    });
+    html += '</table><p class="dim">Slot totals — ' + Object.keys(r.slotCoverage).map(function(s){
+      return SLOT_LABELS[s] + ': ' + r.slotCoverage[s].covered + '/' + r.slotCoverage[s].total;
+    }).join(' · ') + '</p>';
+
+    if (r.checklist.length) {
+      html += '<h2>Missing keyword slots — fix list</h2><ul>';
+      r.checklist.forEach(function(c){
+        html += '<li>' + esc(c.text) + '</li>';
+      });
+      html += '</ul>';
+    } else {
+      html += '<p><span class="pill ok">FULL COVERAGE</span> Every keyword appears in every slot.</p>';
+    }
+
+    var h = r.hashtags;
+    var hcls = h.status === "pass" ? "ok" : h.status === "warn" ? "warn" : "bad";
+    html += '<h2>Hashtag validation — ' + esc(h.platformLabel) + '</h2>' +
+      '<p><span class="pill ' + hcls + '">' + h.status.toUpperCase() + '</span> ' + esc(h.note) + '</p>' +
+      (h.tags.length ? '<p>' + h.tags.map(function(t){ return '<span class="kw">#' + esc(t) + '</span>'; }).join('') + '</p>' : '') +
+      '<p class="dim">Range ' + h.range.min + '–' + h.range.max + ' · ' + esc(h.guidanceSource) + '.</p>';
+
+    html += '</div>';
+    el.innerHTML = html;
+  }
+
+  function run(){
+    var input = collect();
+    var r = CaptionSEO.analyze(input);
+    render(r);
+  }
+
+  $("btn-analyze").addEventListener("click", run);
+
+  $("btn-share").addEventListener("click", function(){
+    var input = collect();
+    var url = location.origin + location.pathname + "?share=" + encodeURIComponent(btoa(unescape(encodeURIComponent(JSON.stringify(input)))));
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(url).then(function(){ $("btn-share").textContent = "Copied!"; });
+    } else { prompt("Copy this share link:", url); }
+  });
+
+  // Deep-link restore: ?share=<base64 JSON>
+  try {
+    var m = /[?&]share=([^&]+)/.exec(location.search);
+    if (m) {
+      var input = JSON.parse(decodeURIComponent(escape(atob(decodeURIComponent(m[1])))));
+      if (input.title) $("f-title").value = input.title;
+      if (input.artist) $("f-artist").value = input.artist;
+      if (input.caption) $("f-caption").value = input.caption;
+      if (input.onscreen) $("f-onscreen").value = input.onscreen;
+      if (input.transcript) $("f-transcript").value = input.transcript;
+      if (input.platform) $("f-platform").value = input.platform;
+      run();
+    }
+  } catch (e) { /* ignore malformed share links */ }
+})();
+</script>
+</body>
+</html>
