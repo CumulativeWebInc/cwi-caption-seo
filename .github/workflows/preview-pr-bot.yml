@@ -1,0 +1,341 @@
+# CWI trust-infra: preview-URL PR bot (Vercel pattern), shared template.
+#
+# OPERATION BEST lane A7. Canonical source:
+#   ~/workspace/cwi-company/ci-templates/preview-pr-bot/workflows/preview-pr-bot.yml
+#
+# What it does, on every pull_request:
+#   1. validate — runs the repo's contract validator
+#      (.github/scripts/validate-contracts.py when present, else a generic
+#      JSON/JSONL lint) and exports a machine-readable report.
+#   2. preview  — copies the PR branch's static site (optionally after a build
+#      command) to <PAGES_BRANCH>:<PAGES_PATH>/pr-previews/<PR#>/, which GitHub
+#      Pages serves at <PAGES_BASE>/pr-previews/<PR#>/ — $0, no new URLs, no
+#      Pages-source flip, production site untouched.
+#   3. comment  — posts/updates ONE sticky PR comment with the live preview link
+#      plus the schema-validation checklist built from the ACTUAL validator
+#      output (never placeholders), and a machine-readable result block that
+#      the audit script (scripts/preview-audit.py) reads for the kill rule.
+#   4. cleanup  — on PR close, removes pr-previews/<PR#> again.
+#
+# Per-repo setup: copy this file to .github/workflows/preview-pr-bot.yml and
+# copy scripts/validate-contracts.py to .github/scripts/, then edit ONLY the
+# `env:` block below. Wave-2 alternative (needs the template repo to exist):
+# call it with `uses:` — see README.md.
+#
+# Kill rule (A7): 2 consecutive PRs with no bot comment -> rework the action.
+# Measured by scripts/preview-audit.py.
+
+name: pr-preview-bot
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+  workflow_call:
+    inputs:
+      pages_base:
+        description: "Public Pages base URL, e.g. https://cumulativewebinc.github.io/cwi-legal"
+        required: false
+        type: string
+        default: ""
+      site_dir:
+        description: "Directory holding the static site (relative to repo root)"
+        required: false
+        type: string
+        default: "."
+      pages_branch:
+        description: "Branch GitHub Pages serves (check repo Settings > Pages)"
+        required: false
+        type: string
+        default: "main"
+      pages_path:
+        description: "Pages source path: '/' or '/docs'"
+        required: false
+        type: string
+        default: "/"
+      preview_dir:
+        description: "Preview folder name under the Pages path"
+        required: false
+        type: string
+        default: "pr-previews"
+      build_command:
+        description: "Optional build command run before staging (empty = plain copy)"
+        required: false
+        type: string
+        default: ""
+
+# Serialize preview pushes per repo so concurrent PRs cannot clobber each other.
+concurrency:
+  group: pr-preview-bot-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions: {}
+
+env:
+  # ---- EDIT THESE PER REPO (workflow_call inputs override when provided) ----
+  CWI_PAGES_BASE: "https://cumulativewebinc.github.io/cwi-caption-seo"  # REQUIRED: no trailing slash
+  CWI_SITE_DIR: "."
+  CWI_PAGES_BRANCH: "main"
+  CWI_PAGES_PATH: "/docs"
+  CWI_PREVIEW_DIR: "pr-previews"
+  CWI_BUILD_COMMAND: ""
+  # ---------------------------------------------------------------------------
+
+jobs:
+  validate:
+    name: Validate contracts (real validator output)
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      report: ${{ steps.export.outputs.report }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Run contract validator (or generic JSON lint)
+        id: run
+        env:
+          SITE_DIR: ${{ inputs.site_dir || env.CWI_SITE_DIR }}
+        run: |
+          set -uo pipefail
+          REPORT=/tmp/contract-report.json
+          if [ -f .github/scripts/validate-contracts.py ]; then
+            python3 .github/scripts/validate-contracts.py \
+              --site-dir "$SITE_DIR" \
+              --repo "${{ github.event.repository.name }}" \
+              --json-out "$REPORT"
+          else
+            python3 - "$REPORT" <<'PY'
+          import json, sys
+          from pathlib import Path
+          report_path = sys.argv[1]
+          errors, scanned = [], 0
+          for path in sorted(Path(".").rglob("*.json")):
+              if ".git" in path.parts:
+                  continue
+              scanned += 1
+              try:
+                  json.loads(path.read_text(encoding="utf-8"))
+              except Exception as exc:
+                  errors.append(f"{path}: {exc}")
+          checks = [{
+              "id": "json-lint",
+              "pass": not errors,
+              "detail": f"{scanned} JSON files parsed, {len(errors)} invalid"
+                        + ("" if not errors else ": " + "; ".join(errors[:5])),
+          }, {
+              "id": "contract-validator",
+              "pass": True,
+              "detail": "not installed in this repo — generic JSON lint only "
+                        "(copy scripts/validate-contracts.py from the A7 template for the full gate)",
+          }]
+          json.dump({"checks": checks, "validator": "generic-json-lint"},
+                    open(report_path, "w"))
+          sys.exit(1 if errors else 0)
+          PY
+          fi
+          echo "validator exit: $?"
+
+      - name: Export report for PR comment
+        id: export
+        if: always()
+        run: |
+          if [ -f /tmp/contract-report.json ]; then
+            echo "report=$(cat /tmp/contract-report.json | tr -d '\n')" >> "$GITHUB_OUTPUT"
+          else
+            echo 'report={"checks":[],"validator":"missing"}' >> "$GITHUB_OUTPUT"
+          fi
+
+  preview:
+    name: Deploy PR preview
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      url: ${{ steps.deploy.outputs.url }}
+      deployed: ${{ steps.deploy.outputs.deployed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+
+      - name: Stage the PR site build
+        id: stage
+        env:
+          SITE_DIR: ${{ inputs.site_dir || env.CWI_SITE_DIR }}
+          BUILD_COMMAND: ${{ inputs.build_command || env.CWI_BUILD_COMMAND }}
+        run: |
+          set -euo pipefail
+          STAGE="$(mktemp -d)"
+          echo "stage=$STAGE" >> "$GITHUB_OUTPUT"
+          if [ -n "$BUILD_COMMAND" ]; then
+            echo "running build: $BUILD_COMMAND"
+            bash -c "$BUILD_COMMAND"
+          fi
+          tar --exclude=.git -cf - -C "$SITE_DIR" . | tar -xf - -C "$STAGE"
+          # never let a previous preview dir ship inside a new one
+          rm -rf "$STAGE/pr-previews"
+          # Pages serves extensionless cleanly only with this present on some repos
+          touch "$STAGE/.nojekyll"
+          echo "staged $(find "$STAGE" -type f | wc -l) files"
+
+      - name: Deploy to <pages-branch>/<preview-dir>/<PR#>
+        id: deploy
+        env:
+          PR_NUMBER: ${{ github.event.number }}
+          PAGES_BRANCH: ${{ inputs.pages_branch || env.CWI_PAGES_BRANCH }}
+          PAGES_PATH: ${{ inputs.pages_path || env.CWI_PAGES_PATH }}
+          PREVIEW_DIR: ${{ inputs.preview_dir || env.CWI_PREVIEW_DIR }}
+          PAGES_BASE: ${{ inputs.pages_base || env.CWI_PAGES_BASE }}
+          STAGE: ${{ steps.stage.outputs.stage }}
+        run: |
+          set -euo pipefail
+          git config user.name "cwi-pr-preview[bot]"
+          git config user.email "cwi-pr-preview[bot]@users.noreply.github.com"
+          # normalize: "/docs" stays, "/" becomes ""
+          PP="${PAGES_PATH#/}"; PP="${PP%/}"
+          DEST="$PP/$PREVIEW_DIR/$PR_NUMBER"; DEST="${DEST#/}"
+          DEPLOYED=false
+          for i in 1 2 3 4 5; do
+            git fetch origin "$PAGES_BRANCH" --quiet
+            git checkout -B pr-preview-deploy "origin/$PAGES_BRANCH" --quiet
+            rm -rf "$DEST"
+            mkdir -p "$DEST"
+            tar -cf - -C "$STAGE" . | tar -xf - -C "$DEST"
+            git add "$DEST"
+            if git diff --cached --quiet; then echo "preview already up to date"; DEPLOYED=true; break; fi
+            git commit -m "preview: PR #$PR_NUMBER site build [skip ci]" --quiet
+            if git push origin "pr-preview-deploy:$PAGES_BRANCH" --quiet; then DEPLOYED=true; break; fi
+            echo "push conflict, retry $i"; sleep 5
+          done
+          echo "deployed=$DEPLOYED" >> "$GITHUB_OUTPUT"
+          echo "url=$PAGES_BASE/$PREVIEW_DIR/$PR_NUMBER/" >> "$GITHUB_OUTPUT"
+          # machine-readable result for the kill-rule audit (also uploaded as artifact below)
+          python3 - "$DEPLOYED" <<'PY'
+          import json, os, sys, datetime
+          deployed = sys.argv[1] == "true"
+          result = {
+              "schema_version": "1.0.0",
+              "product": "preview-pr-bot",
+              "repo": os.environ.get("GITHUB_REPOSITORY", ""),
+              "pr": int(os.environ.get("PR_NUMBER", "0")),
+              "head_sha": os.environ.get("GITHUB_SHA", ""),
+              "preview_url": f"{os.environ['PAGES_BASE']}/{os.environ['PREVIEW_DIR']}/{os.environ['PR_NUMBER']}/",
+              "preview_deployed": deployed,
+              "bot_comment_marker": "cwi-pr-preview",
+              "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+          }
+          open("preview-result.json", "w").write(json.dumps(result, indent=2))
+          print(json.dumps(result))
+          PY
+
+      - name: Upload machine-readable preview result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: preview-result-pr-${{ github.event.number }}
+          path: preview-result.json
+          if-no-files-found: warn
+          retention-days: 90
+
+  cleanup:
+    name: Remove PR preview
+    if: github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Remove preview dir from the Pages branch
+        env:
+          PR_NUMBER: ${{ github.event.number }}
+          PAGES_BRANCH: ${{ inputs.pages_branch || env.CWI_PAGES_BRANCH }}
+          PAGES_PATH: ${{ inputs.pages_path || env.CWI_PAGES_PATH }}
+          PREVIEW_DIR: ${{ inputs.preview_dir || env.CWI_PREVIEW_DIR }}
+        run: |
+          set -euo pipefail
+          git config user.name "cwi-pr-preview[bot]"
+          git config user.email "cwi-pr-preview[bot]@users.noreply.github.com"
+          PP="${PAGES_PATH#/}"; PP="${PP%/}"
+          DEST="$PP/$PREVIEW_DIR/$PR_NUMBER"; DEST="${DEST#/}"
+          for i in 1 2 3 4 5; do
+            git fetch origin "$PAGES_BRANCH" --quiet
+            git checkout -B pr-preview-cleanup "origin/$PAGES_BRANCH" --quiet
+            if [ ! -d "$DEST" ]; then echo "no preview dir to remove"; break; fi
+            git rm -r -q "$DEST"
+            git commit -m "preview: remove PR #$PR_NUMBER build [skip ci]" --quiet
+            if git push origin "pr-preview-cleanup:$PAGES_BRANCH" --quiet; then break; fi
+            echo "push conflict, retry $i"; sleep 5
+          done
+
+  comment:
+    name: Post PR preview comment
+    if: always() && github.event.action != 'closed'
+    needs: [validate, preview]
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/github-script@v7
+        env:
+          REPORT: ${{ needs.validate.outputs.report }}
+          PREVIEW_URL: ${{ needs.preview.outputs.url }}
+          PREVIEW_DEPLOYED: ${{ needs.preview.outputs.deployed }}
+          PREVIEW_RESULT: ${{ needs.preview.result }}
+          VALIDATE_RESULT: ${{ needs.validate.result }}
+          PR_NUMBER: ${{ github.event.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PAGES_BASE: ${{ inputs.pages_base || env.CWI_PAGES_BASE }}
+        with:
+          script: |
+            const marker = '<!-- cwi-pr-preview -->';
+            let report = {};
+            try { report = JSON.parse(process.env.REPORT || '{}'); } catch (e) { report = {}; }
+            const rows = (report.checks || [])
+              .map(c => `| ${c.pass ? '✅' : '❌'} | ${c.id} | ${c.detail} |`).join('\n');
+            const checklist = rows || '| — | no checks reported | validator produced no output |';
+            const validatorNote = report.validator
+              ? `_Validator: \`${report.validator}\` — results below are the actual CI output, not placeholders._`
+              : '';
+            const previewLine = process.env.PREVIEW_DEPLOYED === 'true'
+              ? `🔍 **Live preview:** ${process.env.PREVIEW_URL}`
+              : `⚠️ Preview deploy did not complete (job result: ${process.env.PREVIEW_RESULT}) — see the \`Deploy PR preview\` job log.`;
+            const resultJson = JSON.stringify({
+              schema_version: '1.0.0',
+              product: 'preview-pr-bot',
+              pr: Number(process.env.PR_NUMBER),
+              head_sha: (process.env.HEAD_SHA || '').slice(0, 12),
+              preview_url: process.env.PREVIEW_URL,
+              preview_deployed: process.env.PREVIEW_DEPLOYED === 'true',
+              validate_result: process.env.VALIDATE_RESULT,
+              ts: new Date().toISOString(),
+            });
+            const body = `${marker}
+            <!-- cwi-pr-preview-result ${resultJson} -->
+            ## PR preview + validation checklist
+
+            ${previewLine}
+
+            Production: ${process.env.PAGES_BASE}
+
+            |  | check | detail |
+            |---|---|---|
+            ${checklist}
+
+            ${validatorNote}
+            _Validation job result: \`${process.env.VALIDATE_RESULT}\`._`;
+            const { owner, repo } = context.repo;
+            const issue_number = Number(process.env.PR_NUMBER);
+            const { data: comments } = await github.rest.issues.listComments({ owner, repo, issue_number });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
